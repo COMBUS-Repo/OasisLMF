@@ -28,10 +28,6 @@ on:
         description: 'If set, build ktools from scratch and use output to build package: [Branch, commit]'
         required: false
         default: ""
-      build_osx:
-        description: 'If set, build ktools from scratch and use output to build package: [true, false]'
-        required: false
-        default: "false"
 
   workflow_call:
     inputs:
@@ -40,22 +36,11 @@ on:
         required: false
         default: ""
         type: string
-      build_osx:
-        description: 'If set, build ktools from scratch and use output to build package: [true, false]'
-        required: false
-        default: "false"
-        type: string
 
     outputs:
-      src_pkg_filename:
-        description: "Source package filename"
-        value: ${{ jobs.oasislmf.outputs.src_pkg_filename }}
       linux_pkg_filename:
         description: "Linux package filename"
         value: ${{ jobs.oasislmf.outputs.linux_pkg_filename }}
-      osx_pkg_filename:
-        description: "OSX package filename"
-        value: ${{ jobs.oasislmf.outputs.osx_pkg_filename }}
 
 jobs:
   ktools:

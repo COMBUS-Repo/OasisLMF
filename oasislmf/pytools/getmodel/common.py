@@ -9,6 +9,14 @@ from oasislmf.pytools.common.data import areaperil_int, oasis_float
 # Footprint file formats in order of priority
 fp_format_priorities = ['parquet', 'binZ', 'bin', 'csv']
 
+
+fp_format_priorities = ['zcbin'] + fp_format_priorities
+zcbin_filename = 'footprint.zcbin'
+zcbin_index = 'footprint.zcidx'
+ZCBinEvent = nb.from_dtype(np.dtype([('areaperil_id', areaperil_int),
+                                ('intensity_bin_id', np.int32)
+                                ]))
+
 # filenames
 footprint_filename = 'footprint.bin'
 footprint_index_filename = 'footprint.idx'

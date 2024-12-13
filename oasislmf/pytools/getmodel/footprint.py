@@ -21,6 +21,8 @@ from .common import (FootprintHeader, EventIndexBin, EventIndexBinZ, Event, Even
                      csvfootprint_filename, parquetfootprint_filename, parquetfootprint_meta_filename,
                      fp_format_priorities)
 
+from .common import (ZCBinEvent, zcbin_filename, zcbin_index)
+from oasislmf.pytools.gulmc.items import read_items
 logger = logging.getLogger(__name__)
 
 uncompressedMask = 1 << 1
@@ -337,6 +339,166 @@ class FootprintParquet(Footprint):
         return numpy_data
 
 
+@nb.njit(nb.int64(nb.uint64), inline='always')
+def get_level(areaperil_id):
+    return np.ceil((np.log(areaperil_id)/np.log(4)))
+
+@nb.njit(cache=True)
+def refactor_fp(footprint, items):        
+    # create the default QK
+    null_qk = np.empty(1, dtype=ZCBinEvent)
+    null_qk[0]['areaperil_id'] = 0
+    null_qk[0]['intensity_bin_id'] = 1
+
+
+    # index footprint
+    contains_subperil = np.full(16, False, dtype=np.bool_)
+    footprint_level_idx = np.zeros(21, dtype=np.int64)
+    new_fp = np.empty(items.shape[0], dtype=Event)
+
+
+    level_idx = 0
+    init_apid = footprint[0]["areaperil_id"]
+    prev_level = get_level(init_apid)
+    for apid_idx in range(footprint.shape[0]):
+        apid = footprint[apid_idx]["areaperil_id"]
+        peril = np.int64(apid) & np.int64(15)
+        contains_subperil[peril - 1] = True
+        level = get_level(apid)
+        if (level > prev_level):
+            prev_level = level
+            footprint_level_idx[level_idx] = apid_idx
+            level_idx += 1  
+        elif (level < prev_level):
+            raise Exception("FP not sorted correctly")
+        
+    footprint_level_idx[level_idx] = footprint.shape[0]
+    level_idx += 1
+    
+    # reindex the footprint
+    footprint_i = 0
+    for i in range (items.shape[0]):
+        item = items[i]
+        areaperil = item['areaperil_id']
+        parent_qk = null_qk[0] 
+
+        while (True):
+            #binary search for the item in the footprint
+            peril = np.int64(areaperil) & np.int64(15)
+
+            if (contains_subperil[peril-1] == False):
+                break
+            
+            ap_found = False
+            level_idx = 0  
+            lower = 0
+            upper = footprint_level_idx[0] - 1
+            mid = int((lower + upper)/2)
+
+
+            while (True):
+                fp_lvl = get_level(footprint[mid]["areaperil_id"])
+                shift = 21 - fp_lvl # temporary patch 
+                item_apid_shift = np.int64((np.int64(areaperil) >> np.int64((shift * 2 + 4))) << np.int64(4)) + np.int64(peril)
+                while(True): # binary search 
+                    mid_apid = footprint[mid]["areaperil_id"]
+
+                    if (upper < lower):
+                        break
+
+                    if (mid_apid == item_apid_shift):
+                        ap_found = True
+                        break
+                    elif (mid_apid < item_apid_shift):
+                        lower = mid + 1
+                    elif (mid_apid > item_apid_shift):
+                        upper = mid - 1
+                    
+                    mid = int((lower + upper) / 2)
+
+                if (ap_found == True):
+                    break
+                elif (level_idx < footprint_level_idx.shape[0] - 1): 
+                    level_idx += 1
+                    lower = footprint_level_idx[level_idx -1]
+                    upper = footprint_level_idx[level_idx] - 1
+                    mid = int((lower + upper) / 2)
+                else:
+                    break
+
+            if (ap_found):
+                parent_qk = footprint[mid]
+            break
+        
+
+        # FIX 20241204: fix empty does not initliaze so "in" must be used ove the initilised values
+        if item['areaperil_id'] not in new_fp['areaperil_id'][:footprint_i]:
+            # replace the hit QK with the item qk so it appears correct to the compenents its passed to 
+            new_fp[footprint_i]['areaperil_id'] = item['areaperil_id']
+            new_fp[footprint_i]['intensity_bin_id'] = parent_qk['intensity_bin_id']
+            new_fp[footprint_i]['probability'] = 1.0
+            footprint_i += 1
+
+    return new_fp[:footprint_i]
+
+class CombusZCBIN(Footprint):
+    footprint_filenames: List[str] = [zcbin_filename, zcbin_index]
+    ALM = os.environ.get('MODEL', 'ALM') == 'ALM'
+
+    def __enter__(self):
+        zcbin_file = self.stack.enter_context(self.storage.with_fileno(zcbin_filename))
+        self.fp = mmap.mmap(zcbin_file.fileno(), length=0, access=mmap.ACCESS_READ)
+        self.filesize = self.fp.size()
+        
+        footprint_header = np.frombuffer(bytearray(self.fp[:FootprintHeader.size]), dtype=FootprintHeader)
+        self.num_intensity_bins = int(footprint_header['num_intensity_bins'])
+        self.has_intensity_uncertainty = int(footprint_header['has_intensity_uncertainty'] & intensityMask)
+
+        # read in the index file and convert to dataframe
+        zcbin_idx = self.stack.enter_context(self.storage.with_fileno(zcbin_index))
+        footprint_mmap = np.memmap(zcbin_idx, dtype=EventIndexBin, mode='r')
+
+        self.footprint_index = pd.DataFrame(
+            footprint_mmap,
+            columns=footprint_mmap.dtype.names
+        )
+        # self.footprint_index.to_csv("fp_index.csv")
+        self.footprint_index = self.footprint_index.set_index('event_id').to_dict('index')
+        self.footprint_key_idx  = list(self.footprint_index)
+
+        #### new methodology 
+        # insteaf of reading in the event and then using a qk binary search, we will read in the event and then
+        # parse the footprint using the items file so the footprint and items fil are matching
+        run_dir = '.' # this is the default it seems for the oasislmf runs since the call to footprint comes from the run dir 
+        input_path = os.path.join(run_dir, 'input')
+        self.items = read_items(input_path)
+
+        return self
+
+    def unpack_event(self, event_id: int):
+        event_info = self.footprint_index.get(event_id)
+        if event_info is None:
+            return
+        else:
+            if (self.footprint_key_idx.index(event_id) + 1) < len(self.footprint_key_idx):
+                next_offset = self.footprint_index.get(self.footprint_key_idx[self.footprint_key_idx.index(event_id) + 1])
+                next_offset = next_offset['offset']
+            else:
+                next_offset = self.filesize
+
+            zdata = self.fp[event_info['offset']: next_offset]
+            data = decompress(zdata)
+            self.footprint = np.frombuffer(data, ZCBinEvent)
+
+        
+    def get_event(self, event_id):
+        ### This is a slightly slower since we are stitching the data together first
+        self.unpack_event(event_id)
+        fp = refactor_fp(self.footprint, self.items)
+        return fp
+    
+
+    
 @nb.njit(cache=True)
 def stitch_data(areaperil_id, intensity_bin_id, probability, buffer):
     """

@@ -17,3 +17,4 @@ shutilwhich
 tabulate>=0.8.2
 tblib
 tqdm
+zlib-ng>=0.5.1

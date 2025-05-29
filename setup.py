@@ -351,6 +351,8 @@ class Publish(Command):
             shutil.rmtree('build')
             shutil.rmtree('oasislmf.egg-info')
 
+from oasislmf.combus.setup import ktools_patch
+InstallKtoolsMixin = ktools_patch(InstallKtoolsMixin)
 
 setup(
     name='oasislmf',
